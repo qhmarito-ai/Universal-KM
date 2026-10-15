@@ -1,0 +1,354 @@
+```lua
+--!strict
+--  ────────────────────────────────────────────────────────────────────────
+--  LocalScript – Flight / Noclip / Infinite Jump / ESP
+--  Works in Studio and any executor that allows LocalScripts.
+--  ────────────────────────────────────────────────────────────────────────
+
+local Players      = game:GetService("Players")
+local RunService   = game:GetService("RunService")
+local UserInput    = game:GetService("UserInputService")
+local Debris       = game:GetService("Debris")
+
+local LocalPlayer  = Players.LocalPlayer
+local PlayerGui    = LocalPlayer:WaitForChild("PlayerGui")
+
+-- ---------- CONFIG ----------
+local FLIGHT_SPEED       = 45          -- studs per second
+local JUMP_POWER         = 50          -- default Roblox jump power (unused, JumpRequest handles)
+local ESP_COLOR          = Color3.new(1, 0, 0)   -- red outline
+local MIN_DT             = 1/60        -- Minimum dt for physics, prevents super-speed on lag spikes
+
+-- ---------- STATE ----------
+local flightEnabled       : boolean = false
+local noclipEnabled       : boolean = false
+local infiniteJumpEnabled : boolean = false
+local espEnabled          : boolean = false
+
+local character : Model? = nil
+local humanoid : Humanoid? = nil
+local rootPart : BasePart? = nil
+
+-- Input state for flight
+local keyState = {
+	W = false, A = false, S = false, D = false,
+	Space = false, LeftCtrl = false
+}
+
+-- Stores original CanCollide values for noclip
+local originalCollide = {} :: {[BasePart]: boolean}
+
+-- Keeps per-character connections so we can clean them up on death
+local charConnections : {RBXScriptConnection} = {}
+
+-- Keeps highlight objects for ESP
+local espObjects : { [Player]: Highlight } = {}
+
+-- GUI References for state updates
+local flightToggleBtn: TextButton
+local noclipToggleBtn: TextButton
+local infiniteJumpToggleBtn: TextButton
+local espToggleBtn: TextButton
+
+-- ---------- HELPERS ----------
+local function disconnectAll(conns : {RBXScriptConnection})
+	for _, c in ipairs(conns) do
+		if c and c.Connected then c:Disconnect() end
+	end
+	table.clear(conns)
+end
+
+local function restoreCollisions()
+	for part, wasCollide in pairs(originalCollide) do
+		if part and part.Parent then -- Ensure part still exists
+			part.CanCollide = wasCollide
+		end
+	end
+	table.clear(originalCollide)
+end
+
+local function setPlatformStand(state : boolean)
+	if humanoid and humanoid.Parent then
+		humanoid.PlatformStand = state
+		if not state then
+			-- Attempt to return humanoid to a normal state to re-enable gravity/physics
+			humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
+		end
+	end
+end
+
+-- ---------- CHARACTER BINDINGS ----------
+local function onCharacterAdded(char : Model)
+	-- Clean up old connections and state
+	disconnectAll(charConnections)
+	restoreCollisions()
+
+	character = char
+	humanoid  = char:WaitForChild("Humanoid") :: Humanoid
+	rootPart  = char:WaitForChild("HumanoidRootPart") :: BasePart
+
+	-- Apply noclip to parts added to character after initial setup
+	table.insert(charConnections, char.DescendantAdded:Connect(function(obj)
+		if noclipEnabled and obj:IsA("BasePart") then
+			if originalCollide[obj] == nil then -- Only store if not already tracked
+				originalCollide[obj] = obj.CanCollide
+			end
+			obj.CanCollide = false
+		end
+	end))
+
+	-- Hook JumpRequest for infinite jump
+	table.insert(charConnections, UserInput.JumpRequest:Connect(function()
+		if infiniteJumpEnabled and humanoid and humanoid.Parent then
+			humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+		end
+	end))
+
+	-- Ensure flight state is consistent with the new character
+	setPlatformStand(flightEnabled)
+end
+
+-- ---------- GLOBAL INPUT LISTENERS (always active) ----------
+UserInput.InputBegan:Connect(function(input, processed)
+	if processed then return end
+	if input.KeyCode == Enum.KeyCode.W then keyState.W = true end
+	if input.KeyCode == Enum.KeyCode.A then keyState.A = true end
+	if input.KeyCode == Enum.KeyCode.S then keyState.S = true end
+	if input.KeyCode == Enum.KeyCode.D then keyState.D = true end
+	if input.KeyCode == Enum.KeyCode.Space then keyState.Space = true end
+	if input.KeyCode == Enum.KeyCode.LeftControl then keyState.LeftCtrl = true end
+end)
+
+UserInput.InputEnded:Connect(function(input)
+	if input.KeyCode == Enum.KeyCode.W then keyState.W = false end
+	if input.KeyCode == Enum.KeyCode.A then keyState.A = false end
+	if input.KeyCode == Enum.KeyCode.S then keyState.S = false end
+	if input.KeyCode == Enum.KeyCode.D then keyState.D = false end
+	if input.KeyCode == Enum.KeyCode.Space then keyState.Space = false end
+	if input.KeyCode == Enum.KeyCode.LeftControl then keyState.LeftCtrl = false end
+end)
+
+-- ---------- GUI ----------
+local gui = Instance.new("ScreenGui")
+gui.Name = "HackGui"
+gui.ResetOnSpawn = false
+gui.Parent = PlayerGui
+
+-- Small draggable toggle button
+local toggleBtn = Instance.new("Frame")
+toggleBtn.Size = UDim2.new(0, 22, 0, 22)
+toggleBtn.Position = UDim2.new(0, 10, 0, 10)
+toggleBtn.BackgroundColor3 = Color3.new(0,0,0)
+toggleBtn.BorderSizePixel = 0
+toggleBtn.Parent = gui
+toggleBtn.ZIndex = 2 -- Ensure it's above other UI
+
+local btnText = Instance.new("TextLabel")
+btnText.Size = UDim2.new(1,0,1,0)
+btnText.BackgroundTransparency = 1
+btnText.Text = "⚙"
+btnText.TextColor3 = Color3.new(1,1,1)
+btnText.TextSize = 18
+btnText.Parent = toggleBtn
+
+-- Dragging logic for the toggle button
+local dragging = false
+local dragStartPos: UDim2
+local mouseOffset: Vector2
+
+toggleBtn.InputBegan:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+		dragging = true
+		dragStartPos = toggleBtn.Position
+		mouseOffset = UserInput:GetMouseLocation() - Vector2.new(toggleBtn.AbsolutePosition.X, toggleBtn.AbsolutePosition.Y)
+		UserInput.MouseIconEnabled = false -- Hide mouse icon while dragging
+	end
+end)
+
+UserInput.InputChanged:Connect(function(input)
+	if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+		local newMousePos = UserInput:GetMouseLocation()
+		local newX = newMousePos.X - mouseOffset.X
+		local newY = newMousePos.Y - mouseOffset.Y
+		toggleBtn.Position = UDim2.new(0, newX, 0, newY)
+	end
+end)
+
+UserInput.InputEnded:Connect(function(input)
+	if (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch) and dragging then
+		dragging = false
+		UserInput.MouseIconEnabled = true -- Restore mouse icon
+	end
+end)
+
+-- Main panel
+local panel = Instance.new("Frame")
+panel.Size = UDim2.new(0, 240, 0, 200) -- Increased height for ESP button
+panel.Position = UDim2.new(0, 40, 0, 10)
+panel.BackgroundColor3 = Color3.new(0.15,0.15,0.15)
+panel.BorderSizePixel = 1
+panel.BorderColor3 = Color3.new(0.3,0.3,0.3)
+panel.Visible = false
+panel.Parent = gui
+panel.ZIndex = 1 -- Below toggle button
+
+local layout = Instance.new("UIListLayout")
+layout.Padding = UDim.new(0,6)
+layout.Parent = panel
+
+local function makeToggle(label : string, initialState: boolean, action : (boolean)->()) : TextButton
+	local btn = Instance.new("TextButton")
+	btn.Size = UDim2.new(1, -10, 0, 30)
+	btn.BackgroundColor3 = Color3.new(0.4,0.4,0.4)
+	btn.TextColor3 = Color3.new(1,1,1)
+	btn.Text = label .. ": " .. (initialState and "ON" or "OFF")
+	btn.Parent = panel
+
+	local state = initialState
+	btn.MouseButton1Click:Connect(function()
+		state = not state
+		btn.Text = label .. ": " .. (state and "ON" or "OFF")
+		action(state)
+	end)
+	return btn
+end
+
+flightToggleBtn = makeToggle("Flight", flightEnabled, function(state)
+	flightEnabled = state
+	setPlatformStand(state)
+end)
+
+noclipToggleBtn = makeToggle("Noclip", noclipEnabled, function(state)
+	noclipEnabled = state
+	if not state then
+		restoreCollisions()
+	end
+end)
+
+infiniteJumpToggleBtn = makeToggle("Infinite Jump", infiniteJumpEnabled, function(state)
+	infiniteJumpEnabled = state
+end)
+
+espToggleBtn = makeToggle("ESP", espEnabled, function(state)
+	espEnabled = state
+	-- Update all existing ESP highlights immediately
+	for _, hl in pairs(espObjects) do
+		hl.Enabled = espEnabled
+	end
+end)
+
+-- Toggle panel visibility
+toggleBtn.InputBegan:Connect(function(inp)
+	if inp.UserInputType == Enum.UserInputType.MouseButton1 and not dragging then
+		panel.Visible = not panel.Visible
+	end
+end)
+
+-- ---------- MAIN LOOPS ----------
+-- Flight loop
+RunService.RenderStepped:Connect(function(dt)
+	if not flightEnabled or not rootPart or not humanoid then return end
+
+	-- Clamp dt to prevent extreme speed on lag spikes
+	dt = math.min(dt, MIN_DT)
+
+	local cam = workspace.CurrentCamera
+	if not cam then return end
+
+	local moveDirection = Vector3.new()
+	if keyState.W then moveDirection += cam.CFrame.LookVector end
+	if keyState.S then moveDirection -= cam.CFrame.LookVector end
+	if keyState.D then moveDirection += cam.CFrame.RightVector end
+	if keyState.A then moveDirection -= cam.CFrame.RightVector end
+	if keyState.Space then moveDirection += Vector3.new(0,1,0) end
+	if keyState.LeftCtrl then moveDirection -= Vector3.new(0,1,0) end
+
+	if moveDirection.Magnitude > 0 then
+		moveDirection = moveDirection.Unit * FLIGHT_SPEED
+		rootPart.Velocity = moveDirection -- Apply velocity directly to HumanoidRootPart
+		humanoid.Sit = false -- Ensure humanoid is not sitting
+	else
+		rootPart.Velocity = Vector3.new(0,0,0) -- Stop if no input
+	end
+end)
+
+-- Noclip loop
+RunService.Stepped:Connect(function()
+	if not noclipEnabled or not character then return end
+	for _, part in ipairs(character:GetDescendants()) do
+		if part:IsA("BasePart") then
+			-- Only store if not already tracked (e.g., from DescendantAdded)
+			if originalCollide[part] == nil then
+				originalCollide[part] = part.CanCollide
+			end
+			part.CanCollide = false
+		end
+	end
+end)
+
+-- ---------- ESP ----------
+local function updateESP()
+	-- Remove highlights for players who have left or lost their character
+	for player, hl in pairs(espObjects) do
+		if not player or not player.Character or not player.Character:FindFirstChildOfClass("Humanoid") then
+			hl:Destroy()
+			espObjects[player] = nil
+		end
+	end
+
+	-- Add or update highlights for current players
+	for _, player in ipairs(Players:GetPlayers()) do
+		if player ~= LocalPlayer and player.Character and player.Character:FindFirstChildOfClass("Humanoid") then
+			local hl = espObjects[player]
+			if not hl then
+				hl = Instance.new("Highlight")
+				hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+				hl.OutlineColor = ESP_COLOR
+				hl.FillTransparency = 1
+				hl.Parent = player.Character
+				espObjects[player] = hl
+			end
+			hl.Enabled = espEnabled -- Control visibility with the toggle
+		end
+	end
+end
+
+-- Refresh ESP every heartbeat
+RunService.Heartbeat:Connect(updateESP)
+
+-- ---------- RESPAWN & SCRIPT LIFECYCLE ----------
+LocalPlayer.CharacterAdded:Connect(onCharacterAdded)
+LocalPlayer.CharacterRemoving:Connect(function()
+	restoreCollisions()
+	-- Reset flight state cleanly
+	setPlatformStand(false)
+	-- Desync GUI button text if user was flying before death
+	if flightEnabled then
+		flightEnabled = false
+		flightToggleBtn.Text = "Flight: OFF"
+	end
+end)
+
+-- Initial character binding if player spawns before script runs
+if LocalPlayer.Character then
+	onCharacterAdded(LocalPlayer.Character)
+end
+
+-- Clean up on script end
+local function cleanup()
+	disconnectAll(charConnections)
+	restoreCollisions()
+	-- Clean up all ESP highlights
+	for _, hl in pairs(espObjects) do
+		hl:Destroy()
+	end
+	table.clear(espObjects)
+end
+
+-- If the script is stopped (e.g., by executor or game ending)
+script.AncestryChanged:Connect(function()
+	if not script:IsDescendantOf(game) then
+		cleanup()
+	end
+end)
+```
